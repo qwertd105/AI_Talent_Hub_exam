@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-stub}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434}
+      AUTO_THRESHOLD: ${AUTO_THRESHOLD:-0.85}
+      REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.45}
+    volumes:
+      - ./data:/srv/data
