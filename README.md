@@ -18,6 +18,38 @@ make run PY=$PY                    # сервис на http://localhost:8000
 
 Провайдер генерации по умолчанию — `stub`: детерминированный ответ, собранный из найденного контекста, без обращения в сеть. Живая генерация включается `LLM_PROVIDER=ollama`. Внешние ключи не нужны нигде.
 
+## Схема репозитория
+
+```
+.
+├── app/                        код сервиса; всё, кроме domain/, не знает о кейсе
+│   ├── main.py                 FastAPI: эндпоинты и сборка приложения
+│   ├── config.py               пороги и параметры из переменных окружения
+│   ├── pipeline.py             оркестрация: быстрый путь, затем медленный
+│   ├── router.py               пороги → решение auto / suggest / review / reject
+│   ├── safety.py               маскирование PII, детекция инъекций, изоляция данных
+│   ├── llm.py                  адаптер генерации: stub/ollama, таймаут, breaker, кеш
+│   ├── queue.py                очередь медленного пути и воркер
+│   ├── store.py                SQLite: задачи, очередь ревью, журнал решений
+│   └── domain/
+│       ├── base.py             протокол домена — контракт для любого кейса
+│       └── tickets.py          ← единственный модуль, знающий о тикетах поддержки
+├── tests/                      37 тестов
+│   ├── test_happy_path.py      обязательный сценарий 1
+│   ├── test_escalation.py      обязательный сценарий 2: эскалация оператору
+│   ├── test_scenarios.py       email как канал, режим suggest
+│   ├── test_degradation.py     поведение при недоступном LLM
+│   ├── test_domain_swap.py     проверка, что вне domain/ знания о кейсе нет
+│   └── …                       роутер, безопасность, хранилище, идемпотентность
+├── scripts/demo.py             прогон всех сценариев одной командой
+├── docs/                       документация решения, см. таблицу в конце
+├── Makefile                    install / test / run / demo / docker
+├── Dockerfile, docker-compose.yml
+└── .github/workflows/ci.yml    прогон тестов на push
+```
+
+Границу «код кейса против кода платформы» держит `tests/test_domain_swap.py`: он подставляет посторонний домен и проверяет, что сервис работает без единой правки вне `app/domain/`.
+
 ## Какие сценарии демонстрируются
 
 | Сценарий | Что показывает | Тест |
@@ -28,16 +60,133 @@ make run PY=$PY                    # сервис на http://localhost:8000
 | Нормализация каналов | email (тема + тело) обрабатывается так же, как сообщение в чате | `tests/test_scenarios.py` |
 | Режим `suggest` | уверенно, но категория закрыта для автоответа → черновик оператору, пользователю ничего | `tests/test_scenarios.py` |
 
-Проверить руками:
+## Пример использования
+
+Ниже реальный вывод сервиса, поля сокращены до значимых. Поднять: `make run PY=$PY`.
+
+**Проверка конфигурации.** Порог автозакрытия виден сразу — он параметр, а не константа в коде.
+
+```bash
+curl -s localhost:8000/health
+```
+```json
+{"status":"ok","llm_provider":"stub","domain":"support_tickets","auto_threshold":0.9}
+```
+
+**Happy path.** Типовой вопрос. Быстрый путь отвечает синхронно, генерация уходит в очередь и отдаёт `task_id`.
 
 ```bash
 curl -s localhost:8000/v1/events -H 'content-type: application/json' \
-  -d '{"text":"Как выгрузить отчёт? Где найти аналитику?"}'      # decision=auto
-curl -s localhost:8000/v1/events -H 'content-type: application/json' \
-  -d '{"text":"Хочу возврат денег, карта 4111 1111 1111 1111"}'  # decision=review
-curl -s localhost:8000/v1/review        # очередь оператора
-curl -s localhost:8000/metrics          # доли решений, вызовы LLM
+  -d '{"text":"Как выгрузить отчёт? Где найти аналитику?"}'
 ```
+```json
+{
+  "request_id": "1ffa10f501f6",
+  "label": "howto",
+  "confidence": 0.95,
+  "decision": "auto",
+  "reason": "уверенность 0.95 >= порога авто 0.9",
+  "pii_masked": [],
+  "task_id": "ad709cb5fd44",
+  "review_id": null,
+  "status": "accepted"
+}
+```
+
+Готовый ответ — по `task_id`. Ответ обязан ссылаться на источник: без ссылки это не ответ, а эскалация.
+
+```bash
+curl -s localhost:8000/v1/tasks/ad709cb5fd44
+```
+```json
+{
+  "id": "ad709cb5fd44", "status": "done",
+  "result": {
+    "answer": "По документам: [KB-101 Аналитика] Отчёты находятся в разделе «Аналитика», выгрузка — кнопка «Экспорт». (источник: фрагмент 1)",
+    "decision": "auto", "degraded": false
+  }
+}
+```
+
+**Рискованный путь.** Обращение про деньги с номером карты. Ключевое в ответе — `confidence` ниже порога здесь ни при чём: решение принято по флагу необратимости, и оно было бы тем же при уверенности 0.99.
+
+```bash
+curl -s localhost:8000/v1/events -H 'content-type: application/json' \
+  -d '{"text":"Хочу возврат денег за подписку, карта 4111 1111 1111 1111"}'
+```
+```json
+{
+  "request_id": "fd9899d2d7bd",
+  "label": "refund",
+  "confidence": 0.8,
+  "decision": "review",
+  "reason": "необратимое действие — решение принимает человек",
+  "pii_masked": ["CARD"],
+  "payload_masked": {"text": "Хочу возврат денег за подписку, карта <CARD>"},
+  "task_id": null,
+  "review_id": "fed76f35e573",
+  "status": "done"
+}
+```
+
+Номер карты вырезан до маршрутизации и до записи в журнал — дальше по системе он не существует. Генерация не запускалась: черновик, который человек всё равно перепишет, не нужен.
+
+**Очередь оператора и вердикт.**
+
+```bash
+curl -s localhost:8000/v1/review
+```
+```json
+{"pending":[{
+  "id": "fed76f35e573",
+  "request_id": "fd9899d2d7bd",
+  "payload_masked": "{\"text\": \"Хочу возврат денег за подписку, карта <CARD>\"}",
+  "reason": "необратимое действие — решение принимает человек",
+  "status": "pending"
+}]}
+```
+
+```bash
+curl -s localhost:8000/v1/review/fed76f35e573 -H 'content-type: application/json' \
+  -d '{"verdict":"approved","reviewer":"operator@support","comment":"проверил оплату, возврат оформлен"}'
+```
+```json
+{"id":"fed76f35e573","status":"resolved","verdict":"approved","reviewer":"operator@support"}
+```
+
+Повторный вызов того же `review_id` вернёт `404`: заявка закрывается один раз, два оператора не могут решить одно обращение.
+
+**Журнал решений — то, чем разбирается жалоба.** Две записи: что решила модель и что решил человек.
+
+```bash
+curl -s localhost:8000/v1/audit/fd9899d2d7bd
+```
+```json
+{"decisions":[
+ {"actor":"model","decision":"review","confidence":0.8,"threshold":0.9,
+  "reason":"необратимое действие — решение принимает человек","model_version":"rules-0.1",
+  "payload_masked":"{\"text\": \"Хочу возврат денег за подписку, карта <CARD>\"}"},
+ {"actor":"human:operator@support","decision":"approved","confidence":null,"threshold":null,
+  "reason":"проверил оплату, возврат оформлен","model_version":"rules-0.1"}
+]}
+```
+
+**Метрики.**
+
+```bash
+curl -s localhost:8000/metrics
+```
+```json
+{"events":2,"auto":1,"suggest":0,"review":1,"reject":0,"degraded":0,"llm_calls":1,"review_pending":0}
+```
+
+**Деградация при недоступном LLM.** Запустить с заведомо мёртвым провайдером:
+
+```bash
+LLM_PROVIDER=ollama LLM_BASE_URL=http://127.0.0.1:9 LLM_TIMEOUT_S=0.5 make run PY=$PY
+```
+
+Тот же happy-path-запрос по-прежнему возвращает `decision=auto` за десятки миллисекунд, но в задаче появится `"degraded": true`, решение переедет в `review`, обращение окажется в очереди оператора с причиной «генерация недоступна», а в `/metrics` счётчик `auto` уменьшится в пользу `review`. Пользователь теряет автоответ, но не ответ и не получает 5xx.
 
 ## Что реализовано, а что архитектурный дизайн
 
